@@ -10,6 +10,7 @@
 
 #include "fwd_dispatch.hpp"
 #include "fwd_kernel.cpp"
+#include "fwd_kernel_quant.cpp"
 #include "fd_combine.hpp"
 
 // ─── SWITCH / LAUNCH macros ───────────────────────────────────────
@@ -61,6 +62,31 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
     // field is needed in the tiling data.
     constexpr CacheLayout kCacheLayout = CacheLayout::nd;
 
+    if constexpr (std::is_same_v<DType, float8_e4m3_t>) {
+        FWD_MASK_SWITCH(a.mask_category, MaskCat, {
+            FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
+                FWD_BOOL_SWITCH(a.paged_kv, IsPaged, {
+                    constexpr auto CacheModeV = IsPaged ? CacheMode::pagedCache : CacheMode::normalCache;
+                    constexpr auto PageShapeV = IsPaged ? PageShape::BnBsND : PageShape::normalShape;
+                    FWD_BOOL_SWITCH(a.has_softcap, HasSoftcap, {
+                        QuantFA::FAInferDnQuant<DType, float, kFormat, kFormat, CacheModeV, PageShapeV,
+                            MaskCat, kCacheLayout, LseMode, HasSoftcap><<<a.block_dim, nullptr, a.stream>>>(
+                            a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device,
+                            a.o_device, a.lse_device, a.q_seq_device, a.kv_seq_device, a.seq_used_q_device,
+                            a.seq_used_kv_device, a.workspace_device, a.tiling_device, a.scale_value,
+                            a.softcap_value, a.num_blocks, a.max_num_blocks_per_batch, a.descales);
+                    });
+                });
+            });
+        });
+        if (a.flash_decode) {
+            FAFlashDecodeCombine<bfloat16_t, true><<<a.combine_block_dim, nullptr, a.stream>>>(
+                a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device, a.o_device,
+                a.lse_device, a.q_seq_device, a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device,
+                a.workspace_device, a.tiling_device, a.scale_value, a.softcap_value,
+                a.num_blocks, a.max_num_blocks_per_batch);
+        }
+    } else {
     FWD_MASK_SWITCH(a.mask_category, MaskCat, {
         FWD_BOOL_SWITCH(a.lse_mode, LseMode, {
             FWD_BOOL_SWITCH(a.enable_dn, IsDN, {
@@ -88,6 +114,7 @@ void launch_fwd_impl(const FwdLaunchArgs& a)
             a.q_device, a.k_device, a.v_device, a.mask_device, a.block_table_device, a.o_device, a.lse_device,
             a.q_seq_device, a.kv_seq_device, a.seq_used_q_device, a.seq_used_kv_device, a.workspace_device,
             a.tiling_device, a.scale_value, a.softcap_value, a.num_blocks, a.max_num_blocks_per_batch);
+    }
     }
 }
 

@@ -28,6 +28,12 @@ constexpr uint32_t Q_N_SPLIT_ALIGN = 2;
 
 constexpr uint32_t UNIT_BLOCK_STACK_NUM = 4;
 
+struct FADescales {
+    GM_ADDR q = nullptr;
+    GM_ADDR k = nullptr;
+    GM_ADDR v = nullptr;
+};
+
 struct FAIKernelParams {
     // Data members
     GM_ADDR q;
@@ -48,6 +54,8 @@ struct FAIKernelParams {
     float softcapValue;
     uint32_t numBlocks;
     uint32_t maxNumBlocksPerBatch;
+
+    FADescales descales;
 
     // Methods
     __aicore__ inline FAIKernelParams() {}

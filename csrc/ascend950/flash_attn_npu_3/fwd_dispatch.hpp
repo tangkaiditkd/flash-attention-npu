@@ -39,6 +39,8 @@ struct FwdLaunchArgs {
     float softcap_value;
     uint32_t num_blocks;
     uint32_t max_num_blocks_per_batch;
+    bool is_fp8 = false;
+    FADescales descales;
 };
 
 // Per-(dtype, layout) implementation, defined in fwd_dispatch_impl.hpp and
@@ -48,13 +50,26 @@ struct FwdLaunchArgs {
 template <typename DType, bool IS_TND>
 void launch_fwd_impl(const FwdLaunchArgs& a);
 
+extern template void launch_fwd_impl<half, false>(const FwdLaunchArgs&);
+extern template void launch_fwd_impl<half, true>(const FwdLaunchArgs&);
+extern template void launch_fwd_impl<bfloat16_t, false>(const FwdLaunchArgs&);
+extern template void launch_fwd_impl<bfloat16_t, true>(const FwdLaunchArgs&);
+extern template void launch_fwd_impl<float8_e4m3_t, false>(const FwdLaunchArgs&);
+extern template void launch_fwd_impl<float8_e4m3_t, true>(const FwdLaunchArgs&);
+
 // Runtime entry: IS_TND is picked from a.layout at runtime, then the matching
 // dtype's launcher is selected. launch_fwd_impl is explicitly instantiated
 // per (dtype, IS_TND) in the autogen TUs.
 inline void launch_fwd(const FwdLaunchArgs& a)
 {
     const bool is_bsnd = (a.layout == Format::BSND);
-    if (a.is_bf16) {
+    if (a.is_fp8) {
+        if (is_bsnd) {
+            launch_fwd_impl<float8_e4m3_t, false>(a);
+        } else {
+            launch_fwd_impl<float8_e4m3_t, true>(a);
+        }
+    } else if (a.is_bf16) {
         if (is_bsnd) {
             launch_fwd_impl<bfloat16_t, false>(a);
         } else {

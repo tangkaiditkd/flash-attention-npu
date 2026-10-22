@@ -9,6 +9,7 @@
 
 #include <torch/extension.h>
 #include <unordered_map>
+#include <numeric>
 
 #include "mha_fwd.cpp"
 #include "mha_bwd.cpp"
@@ -66,7 +67,7 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
                                   int64_t headdim, int64_t headdim_v, at::Tensor cache_seqlens,
                                   std::optional<at::Tensor> seqlens_q, std::optional<at::Tensor> cu_seqlens_k,
                                   std::optional<int64_t> page_size, bool causal, bool hasSoftcap, int64_t num_splits,
-                                  int64_t max_seqlen_k, int64_t window_size_left, int64_t window_size_right)
+                                  int64_t max_seqlen_k, int64_t window_size_left, int64_t window_size_right, bool is_fp8)
 {
     const c10::OptionalDeviceGuard device_guard(device_of(cache_seqlens));
     TORCH_CHECK(cache_seqlens.dtype() == torch::kInt32, "cache_seqlens must have dtype int32");
@@ -120,9 +121,87 @@ at::Tensor get_scheduler_metadata(int64_t batch_size, int64_t max_seqlen_q, int6
     args.isVarlen = is_varlen_q ? 1u : 0u;
     args.isVarlenKv = is_varlen_kv ? 1u : 0u;
     args.pagedKV = page_size.has_value() ? 1u : 0u;
+    args.isFp8 = is_fp8;
     // Schedule is scale/softcap independent; hasSoftcap is API parity only.
     (void)hasSoftcap;
     return GetSchedulerMetadataImpl(args, cache_seqlens, seqlens_q);
+}
+
+// Precision tooling calls the production planner, or describes an AICPU-produced
+// metadata tensor. Device-to-host reads occur only in this explicit debug API.
+static pybind11::dict DescribeFwdPlan(const FAInferTilingData& t)
+{
+    pybind11::dict result;
+    result["q_tile"] = t.qBaseTile;
+    result["kv_tile"] = t.kvBaseTile;
+    result["flash_decode"] = t.flashDecodeFlag != 0;
+    result["row_capacity"] = t.fdRowCapacity;
+    result["lse_sub_stride"] = t.fdLseSubStride;
+    result["workspace_bytes"] = t.workSpaceSize;
+    result["is_fp8"] = t.isFp8;
+    result["fp8_softmax_dn"] = t.isFp8 != 0;
+    pybind11::list decode, combine;
+    for (uint32_t i = 0; i < t.fdActiveCoreNum; ++i) {
+        const auto& d = t.fdDecodeSchedules[i];
+        decode.append(pybind11::make_tuple(d.baseTaskStart, d.baseTaskEnd, d.firstKvTileStart, d.lastKvTileEnd));
+    }
+    for (uint32_t i = 0; i < t.fdCombineTaskNum; ++i) {
+        const auto& c = t.fdCombineSchedules[i];
+        combine.append(pybind11::make_tuple(c.baseTask, c.firstCore, c.partialStart, c.partialCount));
+    }
+    result["decode"] = decode;
+    result["combine"] = combine;
+    return result;
+}
+
+template <bool IsFp8>
+static pybind11::dict GetFwdDebugPlan(std::vector<int32_t> qLengths, std::vector<int32_t> kvLengths,
+    int32_t qHeads, int32_t kvHeads, int32_t pageSize, bool isTnd, uint32_t splits,
+    bool causal, int64_t left, int64_t right, uint32_t cores)
+{
+    optiling::FAInferContext ctx;
+    ctx.batch = qLengths.size();
+    ctx.numHeads = qHeads;
+    ctx.kvHeads = kvHeads;
+    ctx.embeddingSize = ctx.embeddingSizeV = 128;
+    ctx.maxQSeqlen = *std::max_element(qLengths.begin(), qLengths.end());
+    ctx.maxKvSeqlen = *std::max_element(kvLengths.begin(), kvLengths.end());
+    auto mask = DeriveFwdMask(causal, left, right, ctx.maxQSeqlen, ctx.maxKvSeqlen);
+    ctx.maskType = mask.is_local ? optiling::MaskType::MASK_BAND :
+        (mask.is_causal ? optiling::MaskType::MASK_SPEC : optiling::MaskType::NO_MASK);
+    ctx.windowSizeLeft = mask.is_local ? mask.window_left : 0;
+    ctx.windowSizeRight = mask.is_local ? mask.window_right : 0;
+    ctx.isTnd = isTnd;
+    ctx.pagedCacheFlag = pageSize != 0;
+    ctx.blockSize = pageSize;
+    ctx.dataType = IsFp8 ? optiling::DataType::FP8 : optiling::DataType::BF16;
+    ctx.numSplits = splits;
+    ctx.lseFlag = true;
+    ctx.flashDecodeFlag = splits != 1 && !mask.is_local && isTnd && pageSize != 0 &&
+        ctx.maxQSeqlen <= 16 && ctx.maxKvSeqlen >= 1024;
+    if (isTnd) {
+        qLengths.insert(qLengths.begin(), 0);
+        std::partial_sum(qLengths.begin(), qLengths.end(), qLengths.begin());
+        if (pageSize == 0) {
+            kvLengths.insert(kvLengths.begin(), 0);
+            std::partial_sum(kvLengths.begin(), kvLengths.end(), kvLengths.begin());
+        }
+    }
+    ctx.qSeqlenList = qLengths.data();
+    ctx.kvSeqlenList = kvLengths.data();
+    FAInferTilingData t{};
+    optiling::FAInferTiling tiler(ctx);
+    tiler.SetCoreNum(cores);
+    tiler.DoTiling(t);
+    return DescribeFwdPlan(t);
+}
+
+static pybind11::dict DescribeFwdMetadata(at::Tensor metadata)
+{
+    auto cpu = metadata.cpu().contiguous();
+    FAInferTilingData t;
+    std::memcpy(&t, cpu.data_ptr(), sizeof(t));
+    return DescribeFwdPlan(t);
 }
 
 PYBIND11_MODULE(flash_attn_npu_3_950, m)
@@ -130,5 +209,8 @@ PYBIND11_MODULE(flash_attn_npu_3_950, m)
     m.doc() = "FlashAttention v3 — Ascend 950 backend";
     m.def("fwd", &mha_fwd, "Forward pass, with KV-cache (Ascend 950)");
     m.def("get_scheduler_metadata", &get_scheduler_metadata, "Precompute scheduler metadata (tiling) on AICPU");
+    m.def("_get_fp8_debug_plan", &GetFwdDebugPlan<true>);
+    m.def("_get_bf16_debug_plan", &GetFwdDebugPlan<false>);
+    m.def("_describe_fwd_metadata", &DescribeFwdMetadata);
     m.def("bwd", &mha_bwd, "Backward pass (Ascend 950)");
 }

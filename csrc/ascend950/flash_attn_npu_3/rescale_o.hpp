@@ -13,6 +13,7 @@
 #include <limits>
 #include <type_traits>
 #include "kernel_common.hpp"
+#include "fa_block.h"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
 #include "tla/tensor.hpp"
@@ -76,6 +77,23 @@ public:
         gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(GM_UB_TENSOR_OFFSET);
         dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(DM_UB_TENSOR_OFFSET);
     }
+
+    __aicore__ inline
+    BlockEpilogue(Arch::Resource<ArchTag> &resource, const UBufTileHelper &ub)
+        : otmpStages_(ub.otmpStages), quantized_(true)
+    {
+        for (uint32_t i = 0; i < otmpStages_; ++i) {
+            loUbTensor[i] = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.loStartOffset + ub.loBufferBytes * i);
+        }
+        goUbTensor32 = resource.ubBuf.template GetBufferByByte<ElementOTmp>(ub.goStartOffset);
+        goUbTensor16 = resource.ubBuf.template GetBufferByByte<ElementO>(ub.goStartOffset);
+        lmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.lmStartOffset);
+        gmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.gmStartOffset);
+        dmUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.dmStartOffset);
+        glUbTensor32 = resource.ubBuf.template GetBufferByByte<float>(ub.glStartOffset);
+    }
+
+    __aicore__ inline void SetOutputScale(float value) { outputScale_ = value; }
 
     template <uint32_t MODE, pipe_t PIPE>
     __aicore__ inline
@@ -228,6 +246,11 @@ public:
         // release lo buf
         SetCrossCoreSync<4, PIPE_V>(pvReadyFlag);
         if (isLastKvSTile) {
+            if (quantized_) {
+                AscendC::PipeBarrier<PIPE_V>();
+                FinishQuantOutput((__ubuf__ float*)goUbTensor32.GetPhyAddr(),
+                    (__ubuf__ float*)glUbTensor32.GetPhyAddr(), rowNumCurSubCore, colStride, outputScale_);
+            }
             AscendC::PipeBarrier<PIPE_V>();
             if (std::is_same<ElementO, bfloat16_t>::value) {
                 AscendC::Cast(
@@ -257,7 +280,7 @@ public:
             if (writePartial) {
                 ComputeLse((__ubuf__ float *)glUbTensor32.GetPhyAddr(),
                     (__ubuf__ float *)gmUbTensor32.GetPhyAddr(),
-                    (__ubuf__ float *)lmUbTensor32.GetPhyAddr(), rowNumCurSubCore);
+                    (__ubuf__ float *)lmUbTensor32.GetPhyAddr(), rowNumCurSubCore, quantized_ ? 1.0f / 256.0f : 1.0f);
                 AscendC::PipeBarrier<PIPE_V>();
                 AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
@@ -341,12 +364,32 @@ public:
         }
     }
 
+    __simd_vf__ static inline void FinishQuantOutput(__ubuf__ float *out, __ubuf__ float *sum,
+                                                      uint32_t rows, uint32_t stride, float scale)
+    {
+        using namespace AscendC::Reg;
+        MaskReg full = CreateMask<float, MaskPattern::ALL>();
+        RegTensor<float> value, denominator, zero;
+        Duplicate(zero, 0.0f);
+        for (uint32_t row = 0; row < rows; ++row) {
+            LoadAlign<float, LoadDist::DIST_BRC_B32>(denominator, sum + row);
+            MaskReg valid;
+            CompareScalar<float, AscendC::CMPMODE::GT>(valid, denominator, 0.0f, full);
+            for (uint32_t col = 0; col < stride; col += 64) {
+                LoadAlign(value, out + row * stride + col);
+                Muls(value, value, scale, full);
+                Select(value, value, zero, valid);
+                StoreAlign(out + row * stride + col, value, full);
+            }
+        }
+    }
+
     // LSE has at most one float vector (64 elements) per sub-core.  Keep the
     // elementwise log(sum) + max in registers, then materialize it in LM for
     // Brcb and the existing block-aligned GM store path.
     __simd_vf__ static inline
     void ComputeLse(__ubuf__ float *glUb, __ubuf__ float *gmUb,
-                           __ubuf__ float *lmUb, uint32_t rowCount)
+                           __ubuf__ float *lmUb, uint32_t rowCount, float sumScale = 1.0f)
     {
         using namespace AscendC::MicroAPI;
         RegTensor<float> sumReg;
@@ -357,8 +400,14 @@ public:
             : UpdateMask<float>(rowCount);
         LoadAlign<float, LoadDist::DIST_NORM>(sumReg, glUb);
         LoadAlign<float, LoadDist::DIST_NORM>(maxReg, gmUb);
+        Muls(sumReg, sumReg, sumScale, mask);
         AscendC::Reg::Ln<float>(lseReg, sumReg, mask);
         AscendC::Reg::Add<float>(lseReg, lseReg, maxReg, mask);
+        RegTensor<float> infinity;
+        Duplicate(infinity, __builtin_inff());
+        MaskReg nonzero;
+        CompareScalar<float, AscendC::CMPMODE::GT>(nonzero, sumReg, 0.0f, mask);
+        Select(lseReg, lseReg, infinity, nonzero);
         StoreAlign<float, StoreDist::DIST_NORM_B32>(lmUb, lseReg, mask);
     }
 
@@ -391,7 +440,7 @@ public:
         AscendC::PipeBarrier<PIPE_V>();
         ComputeLse((__ubuf__ float *)glUbTensor32.GetPhyAddr(),
             (__ubuf__ float *)gmUbTensor32.GetPhyAddr(),
-            (__ubuf__ float *)lmUbTensor32.GetPhyAddr(), rowCount);
+            (__ubuf__ float *)lmUbTensor32.GetPhyAddr(), rowCount, quantized_ ? 1.0f / 256.0f : 1.0f);
         AscendC::PipeBarrier<PIPE_V>();
         // Brcb expands each scalar LSE into one contiguous 32-byte block.
         // That block-aligned source is required by DataCopyPad for its 4-byte
@@ -781,7 +830,7 @@ public:
         auto gOTensorTlaTile = GetTile(gOTensor,
             tla::MakeCoord(qNBlockSize == 1U ? rowOffsetCurSubCore : 0U, 0),
             tla::MakeShape(rowNumCurSubCore, colNumCurSubCore));
-        uint32_t ubOTmpBufId = gatheredKvSTileIdx % UB_OTMP_BUF_STAGES;
+        uint32_t ubOTmpBufId = gatheredKvSTileIdx % otmpStages_;
         uint32_t vlElemNum = AscendC::GetVecLen() / sizeof(ElementOTmp);
         bool headdimAligned64 = (colNumOri % 64 == 0);
         if (rowNumCurSubCore > 0) {
@@ -832,6 +881,9 @@ public:
         }
     }
 private:
+    uint32_t otmpStages_ = UB_OTMP_BUF_STAGES;
+    bool quantized_ = false;
+    float outputScale_ = 1.0f;
     AscendC::LocalTensor<ElementOTmp> loUbTensor[UB_OTMP_BUF_STAGES];
     AscendC::LocalTensor<SMDtype> dmUbTensor16;
     AscendC::LocalTensor<SMDtype> glUbTensor16;
